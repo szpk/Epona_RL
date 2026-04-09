@@ -49,7 +49,7 @@ tdir="exp/job_tboard"
 validation_dir="exp/validation"
 
 diffusion_model_type="flow"
-num_sampling_steps=100
+num_sampling_steps=5
 lambda_yaw_pose=1.0
 
 diff_only=True
@@ -71,7 +71,7 @@ return_predict_traj=True
 
 fix_stt=False
 fix_dit=True
-test_video_frames=50
+test_video_frames=10
 drop_feature=0
 no_pose=False
 sample_prob=[1.0]

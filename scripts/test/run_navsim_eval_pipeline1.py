@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import pickle
 import subprocess
@@ -20,9 +21,9 @@ from navsim.common.dataclasses import SceneFilter, SensorConfig, Trajectory
 from navsim.common.dataloader import SceneLoader
 
 
-def _run_command(cmd: List[str]) -> None:
+def _run_command(cmd: List[str], env=None) -> None:
     print("Running:", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(ROOT), check=True)
+    subprocess.run(cmd, cwd=str(ROOT), check=True, env=env)
 
 
 def _resample_trajectory(poses: np.ndarray, target_len: int) -> np.ndarray:
@@ -161,6 +162,39 @@ def add_arguments():
     return cfg
 
 
+def _build_inference_cmd(cfg, gpu_start_id: int, gpu_end_id: int, device: str) -> List[str]:
+    """Build the inference command for a single GPU shard."""
+    cmd = [
+        sys.executable,
+        "scripts/test/test_navsim_traj.py",
+        "--exp_name", cfg.exp_name,
+        "--config", cfg.config,
+        "--resume_path", cfg.resume_path,
+        "--navsim_log_path", cfg.navsim_log_path,
+        "--sensor_blobs_path", cfg.sensor_blobs_path,
+        "--frame_interval", str(cfg.frame_interval),
+        "--start_id", str(gpu_start_id),
+        "--end_id", str(gpu_end_id),
+        "--device", device,
+        "--save_video_path", cfg.save_video_path,
+        "--output_time_horizon", str(cfg.output_time_horizon),
+        "--output_interval", str(cfg.output_interval),
+        "--condition_frames", str(cfg.condition_frames),
+        "--traj_len", str(cfg.traj_len),
+    ]
+    if cfg.no_amp:
+        cmd.append("--no_amp")
+    if cfg.vae_ckpt:
+        cmd.extend(["--vae_ckpt", cfg.vae_ckpt])
+    if cfg.navsim_history_frames is not None:
+        cmd.extend(["--navsim_history_frames", str(cfg.navsim_history_frames)])
+    if cfg.navsim_future_frames is not None:
+        cmd.extend(["--navsim_future_frames", str(cfg.navsim_future_frames)])
+    if cfg.max_scenes is not None:
+        cmd.extend(["--max_scenes", str(cfg.max_scenes)])
+    return cmd
+
+
 def main(cfg):
     if not cfg.navsim_log_path or not cfg.sensor_blobs_path:
         raise ValueError("navsim_log_path and sensor_blobs_path are required.")
@@ -172,7 +206,7 @@ def main(cfg):
         raise FileNotFoundError(f"sensor_blobs_path does not exist: {cfg.sensor_blobs_path}")
     if not os.environ.get("NUPLAN_MAPS_ROOT"):
         raise EnvironmentError("NUPLAN_MAPS_ROOT is required for metric caching.")
-    
+
     exp_root = cfg.navsim_exp_root or "navsim_exp"
     metric_cache_path = cfg.metric_cache_path or os.path.join(exp_root, "metric_cache")
     submission_path = cfg.submission_path or os.path.join(
@@ -183,51 +217,52 @@ def main(cfg):
     tokens, total_tokens = _collect_tokens(cfg, scene_filter)
     if not tokens:
         raise RuntimeError("No tokens found for the given scene filter.")
-    
-    inference_cmd = [
-        sys.executable,
-        "scripts/test/test_navsim_traj.py",
-        "--exp_name",
-        cfg.exp_name,
-        "--config",
-        cfg.config,
-        "--resume_path",
-        cfg.resume_path,
-        "--navsim_log_path",
-        cfg.navsim_log_path,
-        "--sensor_blobs_path",
-        cfg.sensor_blobs_path,
-        "--frame_interval",
-        str(cfg.frame_interval),
-        "--start_id",
-        str(cfg.start_id),
-        "--end_id",
-        str(cfg.end_id),
-        "--device",
-        cfg.device,
-        "--save_video_path",
-        cfg.save_video_path,
-        "--output_time_horizon",
-        str(cfg.output_time_horizon),
-        "--output_interval",
-        str(cfg.output_interval),
-        "--condition_frames",
-        str(cfg.condition_frames),
-        "--traj_len",
-        str(cfg.traj_len),
-    ]
-    if cfg.no_amp:
-        inference_cmd.append("--no_amp")
-    if cfg.vae_ckpt:
-        inference_cmd.extend(["--vae_ckpt", cfg.vae_ckpt])
-    if cfg.navsim_history_frames is not None:
-        inference_cmd.extend(["--navsim_history_frames", str(cfg.navsim_history_frames)])
-    if cfg.navsim_future_frames is not None:
-        inference_cmd.extend(["--navsim_future_frames", str(cfg.navsim_future_frames)])
-    if cfg.max_scenes is not None:
-        inference_cmd.extend(["--max_scenes", str(cfg.max_scenes)])
-    
-    _run_command(inference_cmd)
+
+    # ---- Multi-GPU parallel inference ----
+    num_gpus = int(os.environ.get("GPUS_NUM", 1))
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cuda_devices:
+        gpu_ids = [g.strip() for g in cuda_devices.split(",") if g.strip()]
+    else:
+        gpu_ids = [str(i) for i in range(num_gpus)]
+    num_gpus = min(num_gpus, len(gpu_ids), len(tokens))
+
+    if num_gpus <= 1:
+        # Single GPU: run directly as before
+        cmd = _build_inference_cmd(cfg, cfg.start_id, cfg.end_id, cfg.device)
+        _run_command(cmd)
+    else:
+        # Multi-GPU: split tokens across GPUs and run in parallel
+        num_tokens = len(tokens)
+        shard_size = math.ceil(num_tokens / num_gpus)
+        processes = []
+        print(f"Launching {num_gpus}-GPU parallel inference "
+              f"({num_tokens} tokens, ~{shard_size} per GPU)")
+        for gpu_idx in range(num_gpus):
+            shard_start = cfg.start_id + gpu_idx * shard_size
+            shard_end = min(cfg.start_id + (gpu_idx + 1) * shard_size, cfg.end_id)
+            if shard_start >= shard_end:
+                break
+            gpu_device = f"cuda"
+            cmd = _build_inference_cmd(cfg, shard_start, shard_end, gpu_device)
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu_ids[gpu_idx]
+            print(f"  GPU {gpu_ids[gpu_idx]}: tokens [{shard_start}, {shard_end})")
+            proc = subprocess.Popen(cmd, cwd=str(ROOT), env=env)
+            processes.append((proc, gpu_ids[gpu_idx]))
+
+        # Wait for all processes and check for errors
+        failed = []
+        for proc, gpu_id in processes:
+            ret = proc.wait()
+            if ret != 0:
+                failed.append(gpu_id)
+        if failed:
+            raise RuntimeError(
+                f"Inference failed on GPU(s): {', '.join(failed)}"
+            )
+        print(f"All {num_gpus} GPU inference processes completed successfully.")
+
     _build_submission(cfg, tokens, Path(submission_path))
     
     node_id = int(os.environ.get("NODE_RANK", 0))
@@ -267,6 +302,27 @@ def main(cfg):
     ]
     # 在 Epona 目录下运行，确保配置文件路径正确
     subprocess.run(score_cmd, cwd=str(ROOT), check=True)
+
+    # 从 resume_path 提取 checkpoint 标签和训练名称，重命名生成的 CSV 文件
+    # 例如 resume_path 为 ".../train-navsim-grpo3/tvar_90000.pkl"
+    # 则 train_name 为 "train-navsim-grpo3"，ckpt_tag 为 "tvar_90000"
+    resume_path = Path(cfg.resume_path)
+    ckpt_tag = resume_path.stem  # e.g. "tvar_90000"
+    train_name = resume_path.parent.name  # e.g. "train-navsim-grpo3"
+    score_dir = Path(score_output_dir)
+    if score_dir.exists():
+        csv_files = sorted(score_dir.glob("*.csv"), key=lambda f: f.stat().st_mtime)
+        if csv_files:
+            latest_csv = csv_files[-1]
+            # 只重命名尚未带 ckpt_tag 的文件
+            if ckpt_tag not in latest_csv.stem:
+                # 目标格式示例：
+                # 原始: 2026.03.12.20.42.32.csv
+                # 新名: 2026.03.12.20.42.32.train-navsim-grpo3.tvar_500.csv
+                new_stem = f"{latest_csv.stem}.{train_name}.{ckpt_tag}"
+                new_name = latest_csv.with_name(f"{new_stem}{latest_csv.suffix}")
+                latest_csv.rename(new_name)
+                print(f"Renamed {latest_csv.name} -> {new_name.name}")
 
 
 if __name__ == "__main__":

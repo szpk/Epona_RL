@@ -49,7 +49,7 @@ tdir="exp/job_tboard"
 validation_dir="exp/validation"
 
 diffusion_model_type="flow"
-num_sampling_steps=10  # 增加采样步数以提高SDE轨迹质量 | Increased for better SDE trajectory quality
+num_sampling_steps=5  # 增加采样步数以提高SDE轨迹质量 | Increased for better SDE trajectory quality
 lambda_yaw_pose=1.0
 
 diff_only=True
@@ -87,9 +87,9 @@ grpo=True
 # GRPO training hyperparameters | GRPO训练超参数
 grpo_sample_time=8  # 增加采样数量以获得更好的advantage估计 | Increased for better advantage estimation
 grpo_gamma_denoising=0.6  # Discount factor for denoising steps | 去噪步骤的折扣因子
-grpo_noise_level=0.3  # 降低SDE噪声水平以提高轨迹质量 | Reduced noise for better trajectory quality (was 0.7 default)
-grpo_bc_coeff=0.01  # 降低BC loss权重，让policy loss有更大影响 | Reduced to let policy loss dominate
-grpo_use_bc_loss=True  # Whether to use BC loss | 是否使用BC损失
+grpo_noise_level=0.3
+grpo_bc_coeff=0.1  
+grpo_use_bc_loss=True  # 启用BC loss + log_prob clamp(-5,2) 防止爆炸 | Enabled with per-element clamp following recogdrive
 
 # Advantage clipping | 优势值裁剪
 grpo_clip_advantage_lower_quantile=0.0  # Lower quantile for advantage clipping | 优势值裁剪的下分位数

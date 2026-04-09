@@ -152,7 +152,9 @@ def train(local_rank, args):
     stt_params, dit_params, traj_params = count_parameters(model.model), count_parameters(model.dit), count_parameters(model.traj_dit)
     print(f"Total Parameters: {format_number(stt_params + dit_params)}, SST Parameters: {format_number(stt_params)}, DiT Parameters: {format_number(dit_params)}, TrajDiT Parameters: {format_number(traj_params)}")
 
-    model = DDP(model, device_ids=[local_rank, ], output_device=local_rank, find_unused_parameters=True)
+    use_grpo = getattr(args, 'grpo', False)
+    if not use_grpo:
+        model = DDP(model, device_ids=[local_rank, ], output_device=local_rank, find_unused_parameters=True)
     tokenizer = VAETokenizer(args, local_rank)
     eff_batch_size = args.batch_size * args.condition_frames // args.block_size * dist.get_world_size()
 
@@ -164,39 +166,59 @@ def train(local_rank, args):
     print("effective batch size: %d" % eff_batch_size)
     lr = args.lr
 
-    param_groups = add_weight_decay(model.module, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    print(optimizer)
-    lr_schedule = init_lr_schedule(optimizer, milstones=[1000000, 1500000, 2000000], gamma=0.5)
+    # For GRPO (no DDP): model is TrainTransformersDiT directly
+    # For non-GRPO (with DDP): model.module is TrainTransformersDiT
+    raw_model = model if use_grpo else model.module
 
+    # Load checkpoints BEFORE freezing and optimizer creation
     skip_key = None
     if args.load_stt_path is not None:
         checkpoint = torch.load(args.load_stt_path, map_location="cpu")
         print(f"Load stt: {args.load_stt_path}")
         skip_key="causal_time_space_blocks"
-        model.module = load_parameters(model.module, checkpoint)
+        raw_model = load_parameters(raw_model, checkpoint)
         del checkpoint
     if args.resume_path is not None:
         checkpoint = torch.load(args.resume_path, map_location="cpu")
         print(f"Load model: {args.resume_path}")
-        model.module = load_parameters(model.module, checkpoint, skip_key=skip_key)
+        raw_model = load_parameters(raw_model, checkpoint, skip_key=skip_key)
         del checkpoint
+
+    # Freeze params BEFORE optimizer creation.
+    # CRITICAL for GRPO: add_weight_decay skips requires_grad=False params,
+    # so freezing first ensures the optimizer only contains trainable params (TrajDiT).
+    # Without this, the optimizer contains ALL 2.53B params but only 59M get gradients,
+    # causing DeepSpeed ZeRO-2's flat buffer gradient-parameter mapping to fail silently.
     if args.fix_stt:
-        for name, param in model.module.named_parameters():
+        for name, param in raw_model.named_parameters():
             if "causal_time_space_blocks" in name:
                 param.requires_grad = False
                 print(f"Frozen: {name}")
     if getattr(args, 'fix_dit', False):
-        for name, param in model.module.named_parameters():
+        for name, param in raw_model.named_parameters():
             if "dit." in name and "traj_dit" not in name:
                 param.requires_grad = False
                 print(f"Frozen: {name}")
 
-    # Initialize GRPO AFTER checkpoint loading and DDP wrapping
+    # Initialize GRPO AFTER checkpoint loading and freezing
     # This ensures: (1) old_policy has pretrained weights, not random init
-    #               (2) old_policy is not tracked by DDP (avoids OOM/NCCL errors)
-    if getattr(args, 'grpo', False):
-        model.module.init_grpo_after_load(args)
+    #               (2) old_policy is not tracked by DeepSpeed (avoids OOM/NCCL errors)
+    if use_grpo:
+        raw_model.init_grpo_after_load(args)
+
+    # Create optimizer AFTER freezing — now add_weight_decay only collects trainable params
+    param_groups = add_weight_decay(raw_model, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    # Log optimizer param count for verification
+    total_opt_params = sum(p.numel() for group in param_groups for p in group['params'])
+    trainable_count = sum(1 for _ in filter(lambda p: p.requires_grad, raw_model.parameters()))
+    print(f"[GRPO_OPT] Optimizer params: {total_opt_params:,} ({total_opt_params/1e6:.1f}M), "
+          f"trainable param tensors: {trainable_count}")
+    print(optimizer)
+    if use_grpo:
+        lr_schedule = init_lr_schedule(optimizer, milstones=[10000, 20000, 30000], gamma=0.5)
+    else:
+        lr_schedule = init_lr_schedule(optimizer, milstones=[100000, 150000, 200000], gamma=0.5)
 
     train_dataset, train_datalist = create_dataset(args)
     if args.overfit:
@@ -240,8 +262,21 @@ def train(local_rank, args):
     )
     load_from_deepspeed_ckpt(args, model)
 
+    # Register gradient hooks AFTER DeepSpeed init to trace if backward() reaches TrajDiT
+    _grpo_grad_hook_log = {}
+    if use_grpo and rank == 0:
+        for name, param in model.module.named_parameters():
+            if "traj_dit" in name and "old_policy" not in name and param.requires_grad:
+                def _make_hook(n):
+                    def _hook(grad):
+                        _grpo_grad_hook_log[n] = grad.float().norm().item()
+                        return grad
+                    return _hook
+                param.register_hook(_make_hook(name))
+                print(f"[HOOK_REGISTERED] {name}")
+
     torch.set_float32_matmul_precision('high')
-    
+
     print('training...')
     torch.cuda.synchronize()
     time_stamp = time.time()
@@ -292,7 +327,81 @@ def train(local_rank, args):
                     print("Loss is {}, stopping training".format(loss_value))
                     sys.exit(1)
                 model.backward(loss_value)
+
+                # Check if gradient hooks fired during backward
+                if use_grpo and step <= 5 and rank == 0:
+                    if _grpo_grad_hook_log:
+                        hook_norms = [f"{k.split('.')[-2]+'.'+k.split('.')[-1]}={v:.4e}" for k, v in list(_grpo_grad_hook_log.items())[:5]]
+                        print(f"[HOOK_FIRED] step={step} n_params={len(_grpo_grad_hook_log)} "
+                              f"samples: {', '.join(hook_norms)}")
+                    else:
+                        print(f"[HOOK_FIRED] step={step} NO HOOKS FIRED — backward did NOT reach TrajDiT!")
+                    _grpo_grad_hook_log.clear()
+
+                # Gradient diagnostics for GRPO debugging
+                if getattr(args, 'grpo', False) and step % 10 == 0 and rank == 0:
+                    traj_dit_grad_norm = 0.0
+                    traj_dit_param_norm = 0.0
+                    num_grad_params = 0
+                    num_zero_grad = 0
+                    # Snapshot parameter values BEFORE optimizer step
+                    param_snapshot = None
+                    for name, param in model.module.named_parameters():
+                        if "traj_dit" in name and "old_policy" not in name and param.requires_grad:
+                            traj_dit_param_norm += param.data.float().norm().item() ** 2
+                            if param_snapshot is None:
+                                param_snapshot = (name, param.data[:2, :3].clone().float())
+                            if param.grad is not None:
+                                traj_dit_grad_norm += param.grad.float().norm().item() ** 2
+                                num_grad_params += 1
+                            else:
+                                num_zero_grad += 1
+                    traj_dit_grad_norm = traj_dit_grad_norm ** 0.5
+                    traj_dit_param_norm = traj_dit_param_norm ** 0.5
+                    print(f"[GRAD] step={step} traj_dit_grad_norm={traj_dit_grad_norm:.6e} "
+                          f"param_norm={traj_dit_param_norm:.6e} "
+                          f"params_with_grad={num_grad_params} zero_grad={num_zero_grad}")
+
                 model.step()
+
+                # Check if parameters actually changed after optimizer step
+                if getattr(args, 'grpo', False) and step % 10 == 0 and rank == 0:
+                    if param_snapshot is not None:
+                        snap_name, snap_before = param_snapshot
+                        for name, param in model.module.named_parameters():
+                            if name == snap_name:
+                                snap_after = param.data[:2, :3].clone().float()
+                                diff = (snap_after - snap_before).abs().max().item()
+                                print(f"[PARAM_UPDATE] step={step} param={snap_name} "
+                                      f"bf16_diff={diff:.6e} "
+                                      f"before={snap_before[0,:3].tolist()} "
+                                      f"after={snap_after[0,:3].tolist()}")
+                                break
+
+                    # Check DeepSpeed fp32 master weights
+                    try:
+                        ds_optimizer = model.optimizer
+                        # BF16_Optimizer stores fp32 master in bit16_groups_flat / fp32_groups_flat
+                        fp32_master = None
+                        if hasattr(ds_optimizer, 'fp32_groups_flat'):
+                            fp32_master = ds_optimizer.fp32_groups_flat
+                        elif hasattr(ds_optimizer, 'single_partition_of_fp32_groups'):
+                            fp32_master = ds_optimizer.single_partition_of_fp32_groups
+
+                        if fp32_master is not None:
+                            # Print first few values of fp32 master to see if they change
+                            for gi, group in enumerate(fp32_master):
+                                print(f"[FP32_MASTER] step={step} group={gi} "
+                                      f"shape={group.shape} first5={group.data.flatten()[:5].tolist()} "
+                                      f"norm={group.data.float().norm().item():.4f}")
+                        else:
+                            # Try to find any fp32 related attributes
+                            fp32_attrs = [a for a in dir(ds_optimizer) if 'fp32' in a.lower() or 'master' in a.lower() or 'bit16' in a.lower()]
+                            print(f"[FP32_MASTER] step={step} could not find fp32 master. "
+                                  f"Optimizer type: {type(ds_optimizer).__name__}, "
+                                  f"fp32-related attrs: {fp32_attrs[:10]}")
+                    except Exception as e:
+                        print(f"[FP32_MASTER] step={step} error: {e}")
                 
                 # if args.return_predict and rank == 0 and step % args.eval_steps == 0:
                 #     predict_latents = loss_final["predict"].detach()
@@ -362,7 +471,7 @@ def train(local_rank, args):
                         bc_loss = bc_loss.to(torch.float32)
                     reward = loss_final.get("reward", torch.tensor(0.0)).to(torch.float32)
                     logger.info('step:{} time:{:.2f}+{:.2f} lr:{:.4e} loss_all:{:.4e} policy_loss:{:.4e} bc_loss:{:.4e} reward:{:.4f}'.format(
-                        step, data_time_interval, train_time_interval, optimizer.param_groups[0]['lr'], 
+                        step, data_time_interval, train_time_interval, optimizer.param_groups[0]['lr'],
                         loss_final["loss_all"].to(torch.float32), policy_loss, bc_loss, reward))
                 else:
                     # Standard training logging
@@ -374,7 +483,18 @@ def train(local_rank, args):
                 save_ckpt_deepspeed(args, save_model_path, model, optimizer, lr_schedule, step)
                 dist.barrier()
                 if rank == 0:
-                    save_ckpt(args, save_model_path, model.module, optimizer, lr_schedule, step)
+                    # For GRPO mode (no DDP), model.module is TrainTransformersDiT directly.
+                    # Add 'module.' prefix to match the checkpoint format expected by load_parameters(),
+                    # which always strips the first dotted prefix (originally from DDP wrapping).
+                    save_model_obj = model.module
+                    if use_grpo:
+                        prefixed_state_dict = {'module.' + k: v for k, v in save_model_obj.state_dict().items()}
+                        ckpt = dict(model_state_dict=prefixed_state_dict)
+                        ckpt_path = '{}/tvar_{}.pkl'.format(save_model_path, str(step))
+                        torch.save(ckpt, ckpt_path)
+                        print(f'#### Save model: {ckpt_path}')
+                    else:
+                        save_ckpt(args, save_model_path, save_model_obj, optimizer, lr_schedule, step)
                 torch.cuda.synchronize()
                 dist.barrier()
         epoch += 1

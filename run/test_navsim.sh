@@ -1,6 +1,7 @@
 export NODES_NUM=1
 export GPUS_NUM=1
-export CUDA_VISIBLE_DEVICES=0 #,1,2,3
+export CUDA_VISIBLE_DEVICES=0
+
 export PYTHONPATH="/inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona:$PYTHONPATH"
 
 # 检查并确保NumPy版本兼容性
@@ -28,20 +29,15 @@ export WORLD_SIZE=1
 export RANK=0
 export LOCAL_RANK=0
 
-#-m debugpy --connect 5678 --wait-for-client
-# python3 scripts/test/test_traj.py \
-# --exp_name "test-nuplan" \
-# --start_id 0 --end_id 100 \
-# --resume_path "/lpai/volumes/ad-agent-vol-ga/wugaoqiang/code/wm_rl/Epona_ckpt/epona_nuplan+nusc.pkl" \
-# --config configs/dit_config_dcae_nuplan.py
+echo "Using ${GPUS_NUM} GPU(s): CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 python scripts/test/run_navsim_eval_pipeline1.py \
 --exp_name "navsim-traj" \
---resume_path "/inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona/exp/ckpt/train-navsim/tvar_90000.pkl" \
+--resume_path "/inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona/exp/ckpt/train-navsim-grpo3/tvar_1500.pkl" \
 --config configs/dit_config_dcae_nuplan.py \
 --navsim_log_path /inspire/hdd/project/roboticsystem2/public/OpenScene/openscene-v1.1/navsim_logs/test \
 --sensor_blobs_path /inspire/hdd/project/roboticsystem2/public/OpenScene/openscene-v1.1/sensor_blobs/test \
 --navsim_exp_root /inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona/exp \
---start_id 0 --end_id 500
+--start_id 0 --end_id 9
 
 # cat /inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona/exp/pdm_scores/2025.12.27.22.30.29.csv # pdm score

@@ -34,12 +34,12 @@ cd $NAVSIM_DEVKIT_ROOT
 
 torchrun --nnodes=$NODES_NUM --nproc_per_node=$GPUS_NUM \
 scripts/train_deepspeed.py \
-  --batch_size 4 \
+  --batch_size 8 \
   --lr 1e-5 \
-  --exp_name "train-navsim-grpo1" \
+  --exp_name "train-navsim-grpo4" \
   --config /inspire/hdd/project/roboticsystem2/jingzhanghui-253108140204/world_model/RL/Epona/configs/dit_config_dcae_navsim_grpo.py \
-  --iter 40000 \
-  --eval_steps 2000 \
+  --iter 5000 \
+  --eval_steps 250 \
   --resume_path "$PRETRAINED_MODEL"
   # 注意：
   # 1. GRPO 训练使用较小的 batch_size 和学习率

@@ -66,7 +66,7 @@ def test_sliding_window_img(val_data, model, args, tokenizer):
         os.makedirs(os.path.join(args.save_video_path, args.exp_name), exist_ok=True)
     
     with torch.no_grad():
-        for i, (img, rot_matrix) in tqdm(enumerate(val_data)):
+        for i, (img, rot_matrix, token) in tqdm(enumerate(val_data)):
             video_save_path = os.path.join(args.save_video_path, args.exp_name, 'sliding_'+str(args.start_id))
             os.makedirs(video_save_path, exist_ok=True)
             model.eval()
@@ -127,7 +127,7 @@ def test_sliding_window_img(val_data, model, args, tokenizer):
                     
                     cv2.imwrite(os.path.join(video_save_path, '%d.png'%(t1+t2+condition_frames)), img_pred_np)
                     condition_imgs.append(img_pred_np)
-                            
+
             create_mp4_imgs(args, condition_imgs, video_save_path, fps=5)
             predict_trajs = torch.cat(predict_trajs)
             print("traj shape:", predict_trajs.shape)

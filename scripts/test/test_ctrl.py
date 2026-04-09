@@ -63,7 +63,7 @@ def test_sliding_window_img(val_data, model, args, tokenizer):
         os.makedirs(os.path.join(args.save_video_path, args.exp_name), exist_ok=True)
     
     with torch.no_grad():
-        for i, (img, rot_matrix) in tqdm(enumerate(val_data)):
+        for i, (img, rot_matrix, token) in tqdm(enumerate(val_data)):
             video_save_path = os.path.join(args.save_video_path, args.exp_name, 'sliding_'+str(i))
             os.makedirs(video_save_path, exist_ok=True)
             model.eval()

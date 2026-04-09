@@ -461,7 +461,9 @@ class TrainTransformersDiT(nn.Module):
                 
                 # Initialize PDM simulator and scorer
                 # NavSim data is at 2Hz (0.5s interval), model outputs 8 waypoints for 4s
-                proposal_sampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
+                # IMPORTANT: Use 0.1s interval for accurate PDM scoring (same as ReCogDrive and test evaluation)
+                # The proposal_sampling is used internally by PDM scorer for trajectory interpolation
+                proposal_sampling = TrajectorySampling(time_horizon=4, interval_length=0.1)
                 self.simulator = PDMSimulator(proposal_sampling)
                 
                 # Use default scorer config or from args
@@ -661,19 +663,38 @@ class TrainTransformersDiT(nn.Module):
         noise_traj = torch.randn(bsz_rep, self.traj_len, self.traj_token_size, device=stt_features.device, dtype=stt_features.dtype)
         timesteps_traj = get_schedule(int(self.args.num_sampling_steps), self.traj_len)
         noise_level = getattr(self.args, 'grpo_noise_level', 0.7)
-        
+
         # Phase 1: Sample trajectories with SDE and collect log probs (no grad)
         with torch.no_grad():
             all_latents, old_log_probs, trajs_normalized, sde_timesteps = self.traj_dit.sample_chain(
                 noise_traj, traj_ids_rep, stt_features_rep, cond_ids_rep, timesteps_traj,
-                deterministic=False, noise_level=noise_level
+                deterministic=False, noise_level=noise_level,
+                clip_x=1.5, clip_y=1.5, clip_yaw=1.5
             )
-        
+
+        # Debug: log trajectory ranges BEFORE denormalization (clone to avoid in-place aliasing)
+        if step <= 10 and self.local_rank == 0:
+            print(f"[GRPO Debug step={step}] "
+                  f"trajs_normalized range: x=[{trajs_normalized[...,0].min().item():.2f},{trajs_normalized[...,0].max().item():.2f}], "
+                  f"y=[{trajs_normalized[...,1].min().item():.2f},{trajs_normalized[...,1].max().item():.2f}], "
+                  f"yaw=[{trajs_normalized[...,2].min().item():.2f},{trajs_normalized[...,2].max().item():.2f}]")
+
         # Denormalize trajectories for reward computation
-        trajs = self.denormalize_traj(trajs_normalized)
-        
+        # Note: denormalize_traj is in-place, so clone first to keep normalized values in all_latents
+        trajs = self.denormalize_traj(trajs_normalized.clone())
+
         # Compute rewards
         rewards = self.reward_fn(trajs, tokens_rep, cache_dict)
+
+        # Debug: log denormalized trajectory ranges and reward statistics
+        if step <= 10 and self.local_rank == 0:
+            print(f"[GRPO Debug step={step}] "
+                  f"trajs (denorm) range: x=[{trajs[...,0].min().item():.2f},{trajs[...,0].max().item():.2f}], "
+                  f"y=[{trajs[...,1].min().item():.2f},{trajs[...,1].max().item():.2f}], "
+                  f"yaw=[{trajs[...,2].min().item():.2f},{trajs[...,2].max().item():.2f}]")
+            print(f"[GRPO Debug step={step}] "
+                  f"rewards: min={rewards.min().item():.4f}, max={rewards.max().item():.4f}, "
+                  f"mean={rewards.mean().item():.4f}, std={rewards.std().item():.4f}")
         
         # Compute advantages
         # rewards shape: (B_orig * F * G,)
@@ -692,46 +713,49 @@ class TrainTransformersDiT(nn.Module):
         # Following flow_grpo's generate_image_learn pattern
         new_log_probs = self.traj_dit.get_logprobs(
             traj_ids_rep, stt_features_rep, cond_ids_rep, all_latents, timesteps_traj,
-            noise_level=noise_level
+            noise_level=noise_level,
+            log_prob_clamp=(-5, 2),  # CRITICAL FIX: clamp per-element BEFORE mean reduction
+                                     # Without this, mean(log_prob) at last denoising step
+                                     # explodes to -30~-100, then outer clamp kills ALL gradient.
+                                     # ReCogDrive clamps per-element first, preserving gradient flow.
         )  # list of K scalar log_probs
-        
+
         num_denoising_steps = len(new_log_probs)
-        
+
         # Compute discounted advantages for each denoising step
         denoising_indices = torch.arange(num_denoising_steps, device=advantages.device)
         discount = (self.grpo_gamma_denoising ** (num_denoising_steps - denoising_indices - 1))
-        
-        # Compute policy loss step by step (per-sample GRPO)
-        # After fixing _sde_step_with_logprob, log_probs are now per-sample: shape (B_total * G,)
-        policy_loss = torch.tensor(0.0, device=stt_features.device, requires_grad=True)
-        clipfrac_list = []
-        
-        clip_range_lt = getattr(self.args, 'grpo_clip_range_lt', 0.2)
-        clip_range_gt = getattr(self.args, 'grpo_clip_range_gt', 0.28)
-        
-        for k in range(num_denoising_steps):
-            # Per-sample importance ratio: exp(new_logprob - old_logprob)
-            # old_lp, new_lp shape: (B_total * G,) — per-sample log probs
-            old_lp = old_log_probs[k].detach()
-            new_lp = new_log_probs[k]
-            ratio = torch.exp(new_lp - old_lp)  # (B_total * G,)
-            
-            # Per-sample advantage, weighted by denoising discount
-            # advantages shape: (B_total * G,), already normalized per group
-            step_advantage = advantages * discount[k]  # (B_total * G,)
-            
-            # Clipped surrogate loss (per-sample, then mean over batch)
-            clipped_ratio = torch.clamp(ratio, 1.0 - clip_range_lt, 1.0 + clip_range_gt)
-            step_loss = -torch.min(ratio * step_advantage, clipped_ratio * step_advantage).mean()
-            
-            policy_loss = policy_loss + step_loss
-            clipfrac_list.append(
-                ((ratio - 1.0).abs() > max(clip_range_lt, clip_range_gt)).float().mean().item()
-            )
-        
-        policy_loss = policy_loss / num_denoising_steps
+
+        # Compute policy loss: REINFORCE (following recogdrive)
+        # PPO ratio is always ~1.0 because old/new log_probs use same weights,
+        # so use explicit REINFORCE: -mean(log_prob * advantage)
+
+        # Stack log probs: list of K tensors (B*G,) -> (B*G, K)
+        log_probs_stacked = torch.stack(new_log_probs, dim=1)
+
+        # Diagnostic: log_prob statistics BEFORE clamp
+        if step <= 20 and self.local_rank == 0:
+            for k in range(log_probs_stacked.shape[1]):
+                lp_k = log_probs_stacked[:, k]
+                pct_clamped = ((lp_k < -5).float().mean() + (lp_k > 2).float().mean()).item() * 100
+                print(f"[LOGPROB] step={step} denoising_k={k}: "
+                      f"mean={lp_k.mean().item():.4f} min={lp_k.min().item():.4f} max={lp_k.max().item():.4f} "
+                      f"has_grad={lp_k.requires_grad} pct_clamped={pct_clamped:.1f}%")
+            adv_nonzero = (advantages.abs() > 0.01).float().mean().item() * 100
+            print(f"[ADV] step={step}: mean={advantages.mean().item():.4f} std={advantages.std().item():.4f} "
+                  f"abs_max={advantages.abs().max().item():.4f} pct_nonzero={adv_nonzero:.1f}%")
+
+        # Per-element clamp following recogdrive's clamp(-5, 2)
+        log_probs_stacked = log_probs_stacked.clamp(min=-5, max=2)
+
+        # Discount and advantage per denoising step
+        adv_expanded = advantages.unsqueeze(1).expand(-1, num_denoising_steps)  # (B*G, K)
+        discount_expanded = discount.unsqueeze(0).expand(adv_expanded.shape[0], -1)  # (B*G, K)
+        adv_weighted = adv_expanded * discount_expanded
+
+        policy_loss = -torch.mean(log_probs_stacked * adv_weighted.detach())
         total_loss = policy_loss
-        
+
         # BC loss (behavioral cloning loss)
         # Use ODE (deterministic) sampling from old_policy to avoid distributional shift!
         # Previously used SDE sampling which trains the model to match noisy trajectories,
@@ -745,20 +769,43 @@ class TrainTransformersDiT(nn.Module):
                 img_ids, cond_ids, traj_ids = prepare_ids(B_total, self.h, self.w, self.total_token_size, self.traj_len, device=stt_features.device)
                 teacher_latents, _, _, _ = old_policy.sample_chain(
                     noise_traj_old, traj_ids, stt_features, cond_ids, timesteps_traj,
-                    deterministic=True, noise_level=noise_level  # ODE: deterministic=True
+                    deterministic=True, noise_level=noise_level,
+                    clip_x=1.5, clip_y=1.5, clip_yaw=1.5
                 )
-            
+
             # Compute log probabilities under current policy
-            # Still use SDE logprobs for the current policy (needed for gradient computation)
+            # Use log_prob_clamp=(-5, 2) following recogdrive to prevent bc_loss explosion
+            # Without clamp, log_prob can reach -1600 when σ is small, making bc_loss dominate
             bc_log_probs = self.traj_dit.get_logprobs(
                 traj_ids, stt_features, cond_ids, teacher_latents, timesteps_traj,
-                noise_level=noise_level
+                noise_level=noise_level,
+                log_prob_clamp=(-5, 2),
             )
             # bc_log_probs are now per-sample after fix: each element shape (B_total,)
             # Stack and mean: first mean over denoising steps, then mean over batch
             bc_loss = -torch.stack(bc_log_probs).mean()
             total_loss = total_loss + self.grpo_bc_coeff * bc_loss
-        
+
+        # Direct gradient flow verification (bypasses DeepSpeed ZeRO-2 partitioning)
+        if step <= 5 and self.local_rank == 0:
+            traj_dit_params = [p for p in self.traj_dit.parameters() if p.requires_grad]
+            print(f"[GRAD_CHECK] step={step} total_loss.requires_grad={total_loss.requires_grad} "
+                  f"total_loss.grad_fn={total_loss.grad_fn} "
+                  f"traj_dit trainable params={len(traj_dit_params)}")
+            if total_loss.requires_grad and len(traj_dit_params) > 0:
+                try:
+                    test_grads = torch.autograd.grad(
+                        total_loss, traj_dit_params[:3],
+                        retain_graph=True, allow_unused=True
+                    )
+                    for j, (g, p) in enumerate(zip(test_grads, traj_dit_params[:3])):
+                        if g is not None:
+                            print(f"[GRAD_CHECK] param[{j}] shape={p.shape} grad_norm={g.float().norm().item():.6e}")
+                        else:
+                            print(f"[GRAD_CHECK] param[{j}] shape={p.shape} grad=None (NOT connected!)")
+                except Exception as e:
+                    print(f"[GRAD_CHECK] autograd.grad failed: {e}")
+
         return {
             "loss_all": total_loss,
             "loss_policy": policy_loss,
